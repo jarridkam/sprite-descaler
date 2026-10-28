@@ -245,8 +245,61 @@ def prepare(img, tw, th, colors=15, margin=1, smooth=0, ss=6, sat=1.2, contrast=
                 for x in range(x0_, x1_):
                     cells[(y // ss, x // ss)] = cells.get((y // ss, x // ss), 0) + 1
             marks.append(dict(cells=cells, area=m["area"]))
+    accents = find_accents(rgb, alpha, ss, lmin)
     return dict(tw=tw, th=th, ss=ss, alpha=alpha, lmin=lmin, rel=rel, marks=marks, pal=pal, labels=labels, freq=freq,
-                blobs=blobs, area_total=area_total, tones=int(tones))
+                blobs=blobs, area_total=area_total, tones=int(tones), accents=accents,
+                map=dict(x0=int(xs.min()), y0=int(ys.min()), w=w, h=h, cw=cw, ch=ch, ox=ox, oy=oy))
+
+
+def find_accents(rgb, alpha, ss, lmin):
+    """Small salient details (eye whites, claws, brows, nostrils, highlights): blobs whose lightness differs a lot from
+    their surroundings, found independently of the palette so they survive color merging and sit on the silhouette
+    edge too. Returns dicts in output-cell units: cx, cy, w, h, rgb, kind ('light'/'dark'), score."""
+    H, W = alpha.shape
+    L = _lum(rgb)
+    m = alpha.astype(np.float64)
+    r = int(round(2.5 * ss))
+    num = _box_blur(np.where(alpha, L, 0.0), r)
+    den = np.maximum(_box_blur(m, r), 1e-3)
+    diff = np.where(alpha, L - num / den, 0.0)
+    lab = np.full((H, W), -1, np.int32)
+    lab[(diff > 22) & alpha] = 0
+    lab[(diff < -40) & alpha] = 1
+    total = int(alpha.sum())
+    out = []
+    for bl in small_blobs(lab, max(8, int(total * 0.02))):
+        wc, hc = (bl["x1"] - bl["x0"]) / ss, (bl["y1"] - bl["y0"]) / ss
+        area_c = bl["area"] / (ss * ss)
+        if area_c < 0.45 or max(wc, hc) > 6 or min(wc, hc) < 0.4:
+            continue
+        ys_ = np.concatenate([np.full(b - a_, y) for (y, a_, b) in bl["runs"]])
+        xs_ = np.concatenate([np.arange(a_, b) for (y, a_, b) in bl["runs"]])
+        px = rgb[ys_, xs_]
+        lp = L[ys_, xs_]
+        pick = lp <= np.percentile(lp, 35) if bl["label"] == 1 else lp >= np.percentile(lp, 65)
+        col = px[pick].mean(axis=0)  # the extreme end of the blob: real white / real ink, not the blurred average
+        sal = float(np.abs(diff[ys_, xs_]).mean())
+        ink_l = float(np.percentile(lmin[ys_, xs_], 15))  # full-res darkest value: real ink even when downsampling grays it
+        out.append(dict(cx=bl["cx"] / ss, ink=ink_l, cy=bl["cy"] / ss, w=wc, h=hc, area=area_c, rgb=col,
+                        kind="light" if bl["label"] == 0 else "dark", score=sal * min(area_c, 4.0) ** 0.5))
+    return out
+
+
+def focus_mask(st, boxes):
+    """Cell mask (th, tw) of source-pixel boxes."""
+    th, tw, ss = st["th"], st["tw"], st["ss"]
+    fm = np.zeros((th, tw), bool)
+    mp = st.get("map")
+    for (x0, y0, x1, y1) in boxes or []:
+        if mp is None:
+            break
+        sx, sy = mp["cw"] / mp["w"], mp["ch"] / mp["h"]
+        a0 = ((min(x0, x1) - mp["x0"]) * sx + mp["ox"]) / ss
+        a1 = ((max(x0, x1) - mp["x0"]) * sx + mp["ox"]) / ss
+        b0 = ((min(y0, y1) - mp["y0"]) * sy + mp["oy"]) / ss
+        b1 = ((max(y0, y1) - mp["y0"]) * sy + mp["oy"]) / ss
+        fm[max(0, int(np.floor(b0))):min(th, int(np.ceil(b1))), max(0, int(np.floor(a0))):min(tw, int(np.ceil(a1)))] = True
+    return fm
 
 
 def _pixel_perfect(line, protected):
@@ -267,15 +320,19 @@ def _pixel_perfect(line, protected):
 def render(st, line=0.4, silhouette=True, detail=0.4, alpha_cut=0.3, speckle=0.6, smooth=0.0,
            merge=0.0, outline_dark=0.4, line_abs=95, line_rel=22, outer=False,
            post_sat=1.0, post_contrast=1.0, bright=0, c15=False,
-           contrast_lines=0.4, tint=0.7, feature=0.7, tidy=True, near_black=(16, 16, 16)):
+           contrast_lines=0.4, tint=0.7, feature=0.7, tidy=True, near_black=(16, 16, 16), accent=0.7, focus=None):
     """Fast stage. Returns RGBA image (tw, th).
     line: how much of the source's ink becomes lines (0 = none). line_abs / line_rel: what counts as ink.
     contrast_lines: lines between very different colors (0 = never, like a belly emblem; 1 = always).
     tint: outline color, 0 = darkest tone (black-ish), 1 = dark version of the color it borders.
+    accent: stamp small salient details (eye whites, claws, brows) at >= 1 px in the closest palette color.
+    focus: list of (x0, y0, x1, y1) boxes in source pixels (a face, hands): inside them every small detail is kept
+    (rare colors win the vote, weaker accents are stamped).
     outline_dark: how dark tinted outlines get (multiplier). feature: protect small enclosed features
     (eyes, mouth, emblems). tidy: pixel-perfect outline cleanup. outer: outline outside the shape."""
     tw, th, ss = st["tw"], st["th"], st["ss"]
     pal0, labels0, alpha = st["pal"], st["labels"], st["alpha"]
+    fm = focus_mask(st, focus)
 
     pal, remap, freq = D.merge_palette(pal0, st["freq"], merge)
     kr = len(pal)
@@ -314,6 +371,11 @@ def render(st, line=0.4, silhouette=True, detail=0.4, alpha_cut=0.3, speckle=0.6
     solid = counts[..., :kr]
     share = solid.max(2) / np.maximum(solid.sum(2), 1)
     win = D.smooth_labels(counts[..., :kr], kr, visible, smooth) if smooth > 0 else solid.argmax(2)
+    if fm.any():  # focus boxes: strong rarity weighting so small distinct colors (eye white, pupil) win their pixel
+        wf = (freq.sum() / np.maximum(freq, 1)) ** (detail + 0.2)
+        wf /= wf.min()
+        raw = counts[..., :kr] / wts
+        win = np.where(fm, (raw * wf).argmax(2), win)
     if speckle > 0:
         win = D.remove_speckles(win, visible, share, speckle)
 
@@ -398,6 +460,32 @@ def render(st, line=0.4, silhouette=True, detail=0.4, alpha_cut=0.3, speckle=0.6
             for (cy, cx) in keep:
                 if visible[cy, cx]:
                     idx[cy, cx] = kr  # near-black tone
+    if accent > 0:
+        min_score = 110 - 90 * accent
+        pl = _lab(palette)
+        for ac in sorted(st["accents"], key=lambda a_: a_["score"]):
+            cx_, cy_ = int(np.clip(ac["cx"], 0, tw - 1)), int(np.clip(ac["cy"], 0, th - 1))
+            inf = bool(fm[cy_, cx_])
+            if ac["score"] < min_score * (0.6 if inf and ac["kind"] == "light" else 1.0):
+                continue
+            pw = int(min(3, max(1, round(ac["w"]))))
+            ph = int(min(3, max(1, round(ac["h"]))))
+            col = np.clip(ac["rgb"], 0, 255).astype(np.uint8)
+            cl = _lab(col)
+            if ac["kind"] == "dark":
+                if ac["ink"] > 70:
+                    continue  # dark but not ink-black: it is shading, the regions already show it
+                ci = tone0
+            else:
+                if cl[0] < 80:
+                    continue
+                ci = int(np.linalg.norm(pl[:kr] - cl, axis=1).argmin())
+            x0 = int(np.floor(ac["cx"] - pw / 2 + 0.5))
+            y0 = int(np.floor(ac["cy"] - ph / 2 + 0.5))
+            for yy in range(max(0, y0), min(th, y0 + ph)):
+                for xx in range(max(0, x0), min(tw, x0 + pw)):
+                    if visible[yy, xx]:
+                        idx[yy, xx] = ci
     pal_out = D.adjust_palette(palette, post_sat, post_contrast, c15)
     if bright:
         pal_out = np.clip(pal_out.astype(np.int32) + int(bright), 0, 255).astype(np.uint8)

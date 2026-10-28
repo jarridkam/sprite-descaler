@@ -8,7 +8,7 @@ from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 import descale as D
 import pixelize as PX
@@ -217,6 +217,9 @@ class App(tk.Tk):
         self.bg_mode = tk.StringVar(value="edges")
         self.bg_color = None
         self.picking = False
+        self.focus = []  # detail boxes in source pixels
+        self.focus_mode = False
+        self._drag = None
         self._clean_cache = None
         self.px_state = None       # prepared pixelizer state
         self.px_key = None
@@ -286,6 +289,7 @@ class App(tk.Tk):
                     ("p_tint", "Outline: black (0) <-> tinted (1)", 0, 1, 0.7, 0.01, "pix"),
                     ("p_odark", "Tinted outline darkness", 0.05, 1, 0.4, 0.01, "pix"),
                     ("p_feat", "Face / feature preserve", 0, 1, 0.7, 0.01, "pix"),
+                    ("p_accent", "Small details (eye whites, claws, brows)", 0, 1, 0.7, 0.01, "pix"),
                     ("p_tones", "Outline tones (re-preps)", 1, 6, 3, 1, "pixprep"),
                     ("p_cut", "Thin-part coverage", 0.05, 0.95, 0.3, 0.01, "pix"),
                     ("p_detail", "Small-detail protect", 0, 1, 0.4, 0.01, "pix"),
@@ -323,6 +327,12 @@ class App(tk.Tk):
                   wraplength=220).pack(anchor="w")
         ttk.Button(t_bg, text="Pick bg color (click Source)", command=self.start_pick).pack(fill="x", pady=2)
         ttk.Button(t_bg, text="Auto bg color", command=self.auto_color).pack(fill="x")
+        frow = ttk.Frame(t_pix)
+        frow.pack(fill="x", pady=2)
+        ttk.Button(frow, text="Detail box: drag on Source", command=self.start_focus).pack(side="left", fill="x", expand=True)
+        ttk.Button(frow, text="Clear", width=6, command=self.clear_focus).pack(side="left", padx=(4, 0))
+        ttk.Label(t_pix, text="Draw boxes around the face / hands: small details inside are kept harder.",
+                  wraplength=220).pack(anchor="w")
         ttk.Checkbutton(t_pix, text="Silhouette outline", variable=self.sil,
                         command=lambda: self.on_change("pix")).pack(anchor="w", pady=2)
         ttk.Checkbutton(t_pix, text="Clean outline corners (pixel-perfect)", variable=self.tidy,
@@ -352,6 +362,8 @@ class App(tk.Tk):
         self.src_lbl = ttk.Label(mid)
         self.src_lbl.pack()
         self.src_lbl.bind("<Button-1>", self.on_src_click)
+        self.src_lbl.bind("<B1-Motion>", self.on_src_drag)
+        self.src_lbl.bind("<ButtonRelease-1>", self.on_src_release)
         ttk.Label(mid, text="Actual size").pack(pady=(8, 0))
         self.actual_lbl = ttk.Label(mid)
         self.actual_lbl.pack()
@@ -479,7 +491,49 @@ class App(tk.Tk):
         self.bg_color = None
         self.on_change("bg")
 
+    def _src_xy(self, e):
+        sw, sh = self.src.size
+        f = min(SRC_PREVIEW / sw, SRC_PREVIEW / sh)
+        return min(max(e.x / f, 0), sw), min(max(e.y / f, 0), sh)
+
+    def start_focus(self):
+        if self.src is None or self.mode != "pixelize":
+            self.status.config(text="Detail boxes work in pixelize mode: open artwork first.")
+            return
+        self.focus_mode = True
+        self.status.config(text="Drag a box on the Source picture around the face or hands.")
+
+    def clear_focus(self):
+        self.focus = []
+        self.focus_mode = False
+        if self.src is not None:
+            self._show_src()
+            if self.mode == "pixelize":
+                self.on_change("pix")
+
+    def on_src_drag(self, e):
+        if self.focus_mode and self.src is not None:
+            x, y = self._src_xy(e)
+            if self._drag is None:
+                self._drag = (x, y, x, y)
+            self._drag = (self._drag[0], self._drag[1], x, y)
+            self._show_src(extra=self._drag)
+
+    def on_src_release(self, e):
+        if self.focus_mode and self._drag is not None:
+            x0, y0, x1, y1 = self._drag
+            self._drag = None
+            self.focus_mode = False
+            if abs(x1 - x0) > 4 and abs(y1 - y0) > 4:
+                self.focus.append((x0, y0, x1, y1))
+                self.on_change("pix")
+            self._show_src()
+
     def on_src_click(self, e):
+        if self.focus_mode and self.src is not None:
+            x, y = self._src_xy(e)
+            self._drag = (x, y, x, y)
+            return
         if not self.picking or self.src is None:
             return
         self.picking = False
@@ -494,6 +548,7 @@ class App(tk.Tk):
 
     def load(self, p):
         self.path = p
+        self.focus = []
         self.src = Image.open(p).convert("RGBA")
         self.px_src = None
         self.bg_color = None
@@ -502,11 +557,16 @@ class App(tk.Tk):
         self.start_advice(self.src)
         self.analyze()
 
-    def _show_src(self):
+    def _show_src(self, extra=None):
         im = self.clean_src(self.src).copy()
+        sw, sh = im.size
         im.thumbnail((SRC_PREVIEW, SRC_PREVIEW), Image.LANCZOS)
         bg = Image.new("RGBA", im.size, (200, 200, 200, 255))
         bg.alpha_composite(im)
+        f = im.size[0] / sw
+        dr = ImageDraw.Draw(bg)
+        for r in list(self.focus) + ([extra] if extra else []):
+            dr.rectangle([r[0] * f, r[1] * f, r[2] * f, r[3] * f], outline=(220, 30, 30, 255), width=2)
         self._src_tk = ImageTk.PhotoImage(bg)
         self.src_lbl.configure(image=self._src_tk)
 
@@ -580,6 +640,7 @@ class App(tk.Tk):
         if self.dirty and not messagebox.askyesno("Discard edits?", "Opening artwork replaces your pixel edits. Continue?"):
             return
         self.path = p
+        self.focus = []
         self.px_src = Image.open(p).convert("RGBA")
         self.mode = "pixelize"
         self.show_tabs()
@@ -609,7 +670,8 @@ class App(tk.Tk):
                    speckle=g("p_speck"), smooth=g("p_smooth2"), merge=g("p_merge"), outline_dark=g("p_odark"),
                    line_abs=g("p_labs"), line_rel=g("p_lrel"), outer=self.outer.get(), post_sat=g("p_psat"),
                    post_contrast=g("p_pcon"), bright=int(g("p_bright")), c15=self.c15.get(),
-                   contrast_lines=g("p_clines"), tint=g("p_tint"), feature=g("p_feat"), tidy=self.tidy.get())
+                   contrast_lines=g("p_clines"), tint=g("p_tint"), feature=g("p_feat"), tidy=self.tidy.get(), accent=g("p_accent"),
+                   focus=list(self.focus))
         old_state = self.px_state if key == self.px_key else None
         self.px_busy = True
         self.status.config(text="Pixelizing…" if old_state is None else "Updating…")

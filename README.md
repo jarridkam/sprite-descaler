@@ -7,6 +7,6 @@ Turns sprites and artwork into Generation-3-style (GBA) pixel art: 64x64 / 32x32
 - **Background remover**, built-in pixel editor, 240x160 GBA preview, Gen 3 checker and input advisor.
 
 Run: `pip install numpy pillow` then `python gui.py` (or `SpriteDescaler.bat`).
-Build exe: `python -m PyInstaller --onefile --windowed --name SpriteDescaler gui.py`.
+Build exe: `python -m PyInstaller --onefile --windowed --name SpriteDescaler --add-data "gen3_profile.json;." gui.py`.
 
 `python calibrate.py <folder of real 64x64 sprites>` rebuilds `gen3_profile.json` (the shipped one was measured from 97 Emerald sprites; the sprites themselves are not included).
