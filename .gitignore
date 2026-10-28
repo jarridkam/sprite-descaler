@@ -1,0 +1,13 @@
+__pycache__/
+build/
+dist/
+lab.npy
+# third-party / user artwork and generated test output stay local
+calib/
+ev/
+final/
+pix/
+test*/
+out*/
+*.png
+!icon*.png
